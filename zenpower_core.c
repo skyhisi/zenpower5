@@ -40,6 +40,13 @@
 #include <linux/pci.h>
 #include <asm/msr.h>
 
+/* cpuid_ecx(): asm/processor.h (pre-6.13) -> asm/cpuid.h -> asm/cpuid/api.h */
+#if __has_include(<asm/cpuid/api.h>)
+#include <asm/cpuid/api.h>
+#elif __has_include(<asm/cpuid.h>)
+#include <asm/cpuid.h>
+#endif
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
 #include <asm/amd/nb.h>
 #else
@@ -58,7 +65,7 @@ static u16 amd_pci_dev_to_node_id(struct pci_dev *pdev)
 MODULE_DESCRIPTION("AMD ZEN family CPU Sensors Driver");
 MODULE_AUTHOR("Anthony Wang");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.5.0");
+MODULE_VERSION("0.5.2");
 
 static bool zen1_calc;
 module_param(zen1_calc, bool, 0);
@@ -100,6 +107,11 @@ MODULE_PARM_DESC(zen1_calc, "Set to 1 to use ZEN1 calculation");
 
 #ifndef PCI_DEVICE_ID_AMD_1AH_M70H_DF_F3
 #define PCI_DEVICE_ID_AMD_1AH_M70H_DF_F3	0x12bb
+#endif
+
+/* Zen5 Strix Point / Krackan Point mobile APUs (1Ah M20h DF F3) */
+#ifndef PCI_DEVICE_ID_AMD_1AH_M20H_DF_F3
+#define PCI_DEVICE_ID_AMD_1AH_M20H_DF_F3	0x16fb
 #endif
 
 /* Zen 5 Granite Ridge (Desktop) */
@@ -285,6 +297,20 @@ static const struct zenpower_model_config model_configs[] = {
 	  .flags = ZEN_CFG_ZEN2_CALC | ZEN_CFG_RAPL | ZEN_CFG_IS_ZEN5 | ZEN_CFG_NO_RAPL_CORE,
 	  .name = "Zen5 Strix Halo (1Ah/70h)" },
 
+	/* Family 1Ah - Zen5 Strix Point (mobile APU, HX 370 / AI 300, Z2
+	 * Extreme; Krackan Point 60h/68h likely identical but untested).
+	 * Zen5 mobile uses SVI3, so SVI2 plane reads are garbage (see
+	 * upstream issue #10 on Strix Halo), and the per-CCD SMN layout
+	 * is not validated on this silicon: expose Tctl + package RAPL
+	 * only. */
+	{ .family = 0x1a, .model = 0x24,
+	  .svi_core_addr = 0,
+	  .svi_soc_addr = 0,
+	  .ccd_temp_base = F1AH_M70H_CCD_TEMP_BASE,
+	  .num_ccds = 0,
+	  .flags = ZEN_CFG_ZEN2_CALC | ZEN_CFG_RAPL | ZEN_CFG_IS_ZEN5 | ZEN_CFG_NO_RAPL_CORE,
+	  .name = "Zen5 Strix Point (1Ah/24h)" },
+
 	{ } /* sentinel - must be last */
 };
 
@@ -318,13 +344,19 @@ static umode_t zenpower_is_visible(const void *rdata,
 		case hwmon_power:
 			if (data->amps_visible == false)
 				return 0;
-			if (channel == 0 && data->svi_core_addr == 0)
-				return 0;
-			if (channel == 1 && data->svi_soc_addr == 0)
-				return 0;
-			/* Hide Core power if unavailable/meaningless (e.g., Strix Halo APU) */
-			if (data->no_rapl_core && channel == 1)
-				return 0;
+			if (data->rapl) {
+				/* RAPL channels: [0]=package, [1]=core */
+				/* Hide Core power if unavailable/meaningless (e.g., Strix Halo APU) */
+				if (channel == 1 && data->no_rapl_core)
+					return 0;
+			} else {
+				if (channel == 0 && data->svi_core_addr == 0)
+					return 0;
+				if (channel == 1 && data->svi_soc_addr == 0)
+					return 0;
+				if (data->no_rapl_core && channel == 1)
+					return 0;
+			}
 			break;
 
 		case hwmon_in:
@@ -395,11 +427,8 @@ static int zenpower_read(struct device *dev, enum hwmon_sensor_types type,
 							*val = zenpower_temp_get_ctl(data);
 							break;
 						case 2 ... 9: // Tccd1-8
-							if (data->zen5) {
-								*val = zenpower_temp_get_ccd(data, F1AH_M70H_CCD_TEMP(channel-2));
-							} else {
-								*val = zenpower_temp_get_ccd(data, F17H_M70H_CCD_TEMP(channel-2));
-							}
+							*val = zenpower_temp_get_ccd(data,
+									data->ccd_temp_base + ((channel-2) * 4));
 							break;
 						default:
 							return -EOPNOTSUPP;
@@ -432,8 +461,8 @@ static int zenpower_read(struct device *dev, enum hwmon_sensor_types type,
 				return -EOPNOTSUPP;
 			}
 
-			/* Zen5 uses RAPL for power monitoring (SVI3 not supported yet) */
-			if (type == hwmon_power && data->zen5) {
+			/* RAPL-based power monitoring (Zen4/Zen5; SVI2/SVI3 readout unavailable) */
+			if (type == hwmon_power && data->rapl) {
 				return zenpower_rapl_read_power(data, channel, val);
 			}
 
@@ -569,7 +598,7 @@ static const char *zenpower_power_label[][2] = {
 	}
 };
 
-static const char *zenpower_power_label_zen5[][2] = {
+static const char *zenpower_power_label_rapl[][2] = {
 	{
 		"RAPL_P_Package",
 		"RAPL_P_Core",
@@ -609,8 +638,8 @@ static int zenpower_read_labels(struct device *dev,
 			break;
 		case hwmon_power:
 			data = dev_get_drvdata(dev);
-			if (data->zen5) {
-				*str = zenpower_power_label_zen5[i][channel];
+			if (data->rapl) {
+				*str = zenpower_power_label_rapl[i][channel];
 			} else {
 				*str = zenpower_power_label[i][channel];
 			}
@@ -780,6 +809,8 @@ static int zenpower_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		/* Apply base configuration from table */
 		data->svi_core_addr = config->svi_core_addr;
 		data->svi_soc_addr = config->svi_soc_addr;
+		data->ccd_temp_base = config->ccd_temp_base;
+		data->rapl = (config->flags & ZEN_CFG_RAPL) != 0;
 		data->amps_visible = true;
 		ccd_check = config->num_ccds;
 
@@ -824,7 +855,9 @@ static int zenpower_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		/* Log configured measurement backends */
 		dev_info(dev, "Measurement methods:\n");
 		if (config->flags & ZEN_CFG_RAPL) {
-			dev_info(dev, "  Power: RAPL MSRs (Package only)\n");
+			dev_info(dev, "  Power: RAPL MSRs (%s)\n",
+				(config->flags & ZEN_CFG_NO_RAPL_CORE) ?
+				"Package only" : "Package + Core");
 		} else {
 			dev_info(dev, "  Power: SVI2 via SMN (Core + SoC)\n");
 		}
@@ -846,7 +879,7 @@ static int zenpower_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 
 	for (i = 0; i < ccd_check; i++) {
-		u32 ccd_addr = data->zen5 ? F1AH_M70H_CCD_TEMP(i) : F17H_M70H_CCD_TEMP(i);
+		u32 ccd_addr = data->ccd_temp_base + (i * 4);
 		data->read_amdsmn_addr(pdev, data->node_id, ccd_addr, &val);
 		/* Check valid bit (BIT(11)) per k10temp driver */
 		if (val & BIT(11)) {
@@ -881,6 +914,7 @@ static const struct pci_device_id zenpower_id_table[] = {
 	{ PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_19H_M40H_DF_F3) },
 	{ PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_19H_M50H_DF_F3) },
 	{ PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_1AH_M70H_DF_F3) },
+	{ PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_1AH_M20H_DF_F3) },
 	{ PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_1AH_M40H_DF_F3) },
 	{}
 };

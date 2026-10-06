@@ -10,6 +10,7 @@ Version 0.5.1 was skipped: it is reserved for the Zen 4 work (zen4-support branc
 
 ### Added
 
+- **SMU PM table backend (Strix Point):** per-core temperature/voltage (12 cores), GFX voltage/current, SoC power fetched via the SMU mailbox (PM table 0x5D0009); new `zenpower_smu.c` backend, hidden automatically when the table is unavailable
 - **Zen 5 Strix Point Support:** AMD Family 1Ah Model 24h (Strix Point - Ryzen AI 300 series, Z2 Extreme)
   - Binds Data Fabric F3 PCI ID 0x16fb (1AH M20h DF F3)
   - Tctl/Tdie temperatures and RAPL package power
